@@ -1,0 +1,171 @@
+"""Tests for the MM strategy ``[cycle]`` log.
+
+Note: the cycle log deliberately does *not* surface the inventory skew --
+see ``tests/test_mm_single_sided_flow.py`` for why it would be misleading.
+"""
+
+import logging
+from collections import defaultdict
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from strategies.market_making_strategy import MarketMakingStrategy
+
+
+def _make_strategy(inventory_skew_bps=2, order_size_usd=100):
+    with patch.object(MarketMakingStrategy, '__init__', lambda self, *a, **k: None):
+        s = MarketMakingStrategy.__new__(MarketMakingStrategy)
+    s.spread_bps = 10
+    s.order_size_usd = order_size_usd
+    s.max_open_orders = 4
+    s.max_positions = 10
+    s.maker_only = True
+    s.close_immediately = False
+    s.account_cap_pct = 0.25
+    s.bbo_mode = False
+    s.bbo_offset_bps = 0
+    s.inventory_skew_bps = inventory_skew_bps
+    s.inventory_skew_cap = 3.0
+    s.vol_adjust_enabled = False
+    s.vol_adjust_multiplier = 2.0
+    s.vol_lookback = 30
+    s._recent_mids = {}
+    s.positions = {}
+    s._orders_placed = 0
+    s._orders_placed_per_coin = defaultdict(int)
+    s._fills_detected = 0
+    s._fills_per_coin = defaultdict(int)
+    s._fill_rate_log_interval = 300
+    s._last_fill_rate_log = 0.0
+    s._prev_position_coins = set()
+    s._prev_positions = {}
+    s.imbalance_threshold = 0.0
+    s.loss_streak_limit = 0
+    s.loss_streak_cooldown = 300
+    s._loss_streaks = defaultdict(int)
+    s._coin_cooldown_until = {}
+    s._quiet_hours = set()
+    s._coin_offset_overrides = {}
+    s._coin_spread_overrides = {}
+    s._coin_size_overrides = {}
+    s._quiet_spread_multiplier = 0.0
+    s._drain_flag_file = ''
+    s._was_drain = False
+    s._spread_schedule = {}
+    s._dynamic_offset_enabled = False
+    s._adverse_tracker = None
+    s._was_quiet = False
+    s._max_coin_status_display = 10
+
+    om = MagicMock()
+    md = MagicMock()
+    md.get_sz_decimals.return_value = 0
+    md.price_rounding_params.return_value = (0, True)
+    s.order_manager = om
+    s.market_data = md
+
+    tracker = MagicMock()
+    tracker.get_order_count.return_value = 0
+    tracker.active_coins.return_value = 0
+    s._tracker = tracker
+
+    closer = MagicMock()
+    closer.tracked_coins = set()
+    closer.get_close_oid.return_value = None
+    s._closer = closer
+
+    s._rejection_tracker = MagicMock()
+    s._rejection_tracker.log_summary_if_due.return_value = False
+
+    return s, om, md
+
+
+class TestMMCycleLog:
+
+    def test_idle_coin(self, caplog):
+        s, om, md = _make_strategy()
+        md.get_market_data.return_value = MagicMock(mid_price=100.0, bid=0, ask=0)
+        md.round_size.return_value = 1.0
+        om.bulk_place_orders.return_value = [MagicMock(id=1), MagicMock(id=2)]
+
+        with caplog.at_level(logging.INFO):
+            s.run(['BTC'])
+
+        cycle_lines = [r for r in caplog.records if '[cycle]' in r.message]
+        assert len(cycle_lines) == 1
+        assert 'BTC:idle' in cycle_lines[0].message
+
+    @pytest.mark.parametrize('inventory_skew_bps', [0, 2])
+    def test_position_never_reports_skew(self, inventory_skew_bps, caplog):
+        """A held position logs ``:pos`` regardless of the configured skew.
+
+        The skew cannot reach an order in the single-sided flow (the coin is
+        delegated to PositionCloser and stops quoting), so surfacing it here
+        would imply an effect that does not exist.
+        """
+        s, om, md = _make_strategy(inventory_skew_bps=inventory_skew_bps, order_size_usd=100)
+        s.positions = {'BTC': {'size': 1.0, 'entry_price': 100.0,
+                               'unrealized_pnl': 0, 'margin_used': 10}}
+        s.update_positions = MagicMock()  # prevent positions reset
+        md.get_market_data.return_value = MagicMock(mid_price=100.0, bid=0, ask=0)
+
+        with caplog.at_level(logging.INFO):
+            s.run(['BTC'])
+
+        cycle_lines = [r for r in caplog.records if '[cycle]' in r.message]
+        assert len(cycle_lines) == 1
+        assert 'BTC:pos' in cycle_lines[0].message
+        assert 'skew' not in cycle_lines[0].message
+        assert '1 pos' in cycle_lines[0].message
+
+    def test_idle_coin_without_market_data(self, caplog):
+        """A flat coin still renders when market data is unavailable.
+
+        The position branch no longer reads market data, so the remaining
+        market-data-dependent path in this log is the idle branch.
+        """
+        s, om, md = _make_strategy()
+        md.get_market_data.return_value = None
+
+        with caplog.at_level(logging.INFO):
+            s.run(['BTC'])
+
+        # Proves the None actually flowed through the quoting path rather than
+        # the assertion passing on an unexercised branch.
+        assert md.get_market_data.called
+        cycle_lines = [r for r in caplog.records if '[cycle]' in r.message]
+        assert len(cycle_lines) == 1
+        assert 'BTC:idle' in cycle_lines[0].message
+        assert '0 pos' in cycle_lines[0].message
+
+    def test_truncation(self, caplog):
+        s, om, md = _make_strategy()
+        s._max_coin_status_display = 3
+        md.get_market_data.return_value = MagicMock(mid_price=100.0, bid=0, ask=0)
+        md.round_size.return_value = 1.0
+        om.bulk_place_orders.return_value = [MagicMock(id=1), MagicMock(id=2)]
+
+        coins = [f'COIN{i}' for i in range(5)]
+        with caplog.at_level(logging.INFO):
+            s.run(coins)
+
+        cycle_lines = [r for r in caplog.records if '[cycle]' in r.message]
+        assert '... +2 more' in cycle_lines[0].message
+
+    def test_active_position_count(self, caplog):
+        s, om, md = _make_strategy(inventory_skew_bps=0)
+        s.positions = {
+            'BTC': {'size': 1.0, 'entry_price': 100.0,
+                    'unrealized_pnl': 0, 'margin_used': 10},
+            'ETH': {'size': -0.5, 'entry_price': 3000.0,
+                    'unrealized_pnl': 0, 'margin_used': 30},
+        }
+        s.update_positions = MagicMock()
+        md.get_market_data.return_value = MagicMock(mid_price=100.0, bid=0, ask=0)
+
+        with caplog.at_level(logging.INFO):
+            s.run(['BTC', 'ETH', 'SOL'])
+
+        cycle_lines = [r for r in caplog.records if '[cycle]' in r.message]
+        assert '2 pos' in cycle_lines[0].message

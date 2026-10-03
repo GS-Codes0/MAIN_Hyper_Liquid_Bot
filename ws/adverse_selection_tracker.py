@@ -1,0 +1,367 @@
+"""Adverse selection measurement for market-making fills.
+
+Tracks mid-price movement after each fill to quantify adverse selection
+per coin.  Outputs periodic summary logs for operational analysis.
+
+This is an observation-only module — it does not affect trading logic.
+
+Usage::
+
+    tracker = AdverseSelectionTracker(market_data_manager)
+    fill_feed.set_adverse_selection_tracker(tracker)
+    ...
+    tracker.stop()
+"""
+
+import logging
+import threading
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from fill_features import FEATURE_SCHEMA_VERSION, compute_fill_features
+
+logger = logging.getLogger(__name__)
+
+# Sample intervals (seconds after fill)
+SAMPLE_INTERVALS = [5, 30, 60]
+SAMPLE_LABELS = ["5s", "30s", "60s"]
+
+# Max fills to keep in memory
+MAX_FILL_BUFFER = 200
+
+# Max per-coin summary snapshots retained for recent-window queries
+MAX_HISTORY = 10
+
+
+def _to_float(value: Any) -> Optional[float]:
+    """Best-effort float conversion; ``None`` when missing or malformed."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass
+class FillSnapshot:
+    """Single fill with post-fill price samples."""
+
+    fill_id: str           # unique id (coin + timestamp)
+    coin: str
+    side: str              # "A" (sell) or "B" (buy)
+    fill_px: float
+    mid_at_fill: float
+    fill_time: float       # monotonic time
+    wall_time: float       # time.time() for logging
+    samples: Dict[str, float] = field(default_factory=dict)  # label -> adverse_bps
+    record: Optional[Dict[str, Any]] = None  # feature record for FillFeatureWriter
+
+
+class AdverseSelectionTracker:
+    """Track post-fill price movement to measure adverse selection."""
+
+    def __init__(
+        self,
+        market_data: Any,
+        log_interval: float = 300.0,
+    ) -> None:
+        self.market_data = market_data
+        self.log_interval = log_interval
+
+        self._fills: deque = deque(maxlen=MAX_FILL_BUFFER)
+        self._lock = threading.Lock()
+        self._running = True
+        self._last_log_time = time.monotonic()
+
+        # Aggregates for periodic logging: coin -> label -> list of adverse_bps
+        self._aggregates: Dict[str, Dict[str, List[float]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        self._fill_count: Dict[str, int] = defaultdict(int)
+
+        # Recent-window summary history (for downstream consumers like
+        # auto-exclude). Each snapshot mirrors the per-coin row produced
+        # by ``_log_summary`` and is appended just before the aggregates
+        # are reset at the end of the interval.
+        self._history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
+
+        # Optional FillFeatureWriter for per-fill feature JSONL logging.
+        self._feature_writer: Any = None
+
+        # Latest per-coin realized volatility (bps), published by the strategy
+        # each cycle and read at fill time for the feature record. A single
+        # float per coin is GIL-atomic, so no lock is taken (main-loop writer,
+        # WS-thread reader — same pattern as the aggregate dicts above).
+        self._coin_vol: Dict[str, Optional[float]] = {}
+
+    def set_feature_writer(self, writer: Any) -> None:
+        """Register a FillFeatureWriter to receive per-fill feature records."""
+        self._feature_writer = writer
+
+    def set_coin_volatility(self, coin: str, vol_bps: Optional[float]) -> None:
+        """Publish the latest realized volatility (bps) for ``coin``.
+
+        Called by the market-making strategy once per cycle; read at fill time
+        by :meth:`_build_feature_record` for the feature JSONL. Observation
+        only — never influences trading.
+        """
+        self._coin_vol[coin] = vol_bps
+
+    # ------------------------------------------------------------------ #
+    #  Fill recording
+    # ------------------------------------------------------------------ #
+
+    def on_fill(
+        self,
+        coin: str,
+        fill_px: float,
+        side: str,
+        fill_time_ms: Optional[int] = None,
+        raw_fill: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Called from FillFeed when a fill occurs.
+
+        Parameters
+        ----------
+        coin : str
+            Coin name (e.g. ``'xyz:SP500'``)
+        fill_px : float
+            Fill price
+        side : str
+            ``'A'`` (sell) or ``'B'`` (buy)
+        fill_time_ms : int, optional
+            Exchange fill timestamp in ms (unused, reserved for future).
+        raw_fill : dict, optional
+            Raw userFills WS fill object. When provided and a feature
+            writer is registered, a per-fill feature record is buffered
+            for JSONL logging. Omitting it preserves legacy behaviour.
+        """
+        if not self._running:
+            return
+
+        try:
+            md = self.market_data.get_market_data(coin)
+            if not md or md.mid_price <= 0:
+                return
+
+            mid_at_fill = md.mid_price
+            now_mono = time.monotonic()
+            now_wall = time.time()
+
+            fill_id = f"{coin}_{now_wall:.3f}"
+            snapshot = FillSnapshot(
+                fill_id=fill_id,
+                coin=coin,
+                side=side,
+                fill_px=fill_px,
+                mid_at_fill=mid_at_fill,
+                fill_time=now_mono,
+                wall_time=now_wall,
+            )
+
+            with self._lock:
+                self._fills.append(snapshot)
+                self._fill_count[coin] += 1
+
+            # Schedule delayed samples
+            for delay, label in zip(SAMPLE_INTERVALS, SAMPLE_LABELS):
+                timer = threading.Timer(delay, self._sample_mid, args=(snapshot, label))
+                timer.daemon = True
+                timer.start()
+
+            # Buffer a feature record for JSONL logging (observation only).
+            # Fail-silent: any error here must not affect markout tracking.
+            if self._feature_writer is not None and raw_fill is not None:
+                try:
+                    snapshot.record = self._build_feature_record(raw_fill, md, now_wall)
+                    self._feature_writer.add(snapshot)
+                except Exception as e:
+                    logger.debug("[adverse] Feature record build failed: %s", e)
+
+            spread_to_mid_bps = (fill_px - mid_at_fill) / mid_at_fill * 10_000
+            logger.debug(
+                "[adverse] Fill %s %s px=%.6f mid=%.6f spread=%.1fbps",
+                side, coin, fill_px, mid_at_fill, spread_to_mid_bps,
+            )
+
+        except Exception as e:
+            logger.error("[adverse] Error recording fill: %s", e)
+
+    def _build_feature_record(
+        self,
+        raw_fill: Dict[str, Any],
+        md: Any,
+        wall_time: float,
+    ) -> Dict[str, Any]:
+        """Compose a JSONL feature record from a raw fill and market data.
+
+        Join keys (``tid`` / ``oid`` / ``hash``) are passed through as-is
+        (``None`` when missing) so downstream consumers can match against
+        the fills database. Feature fields come from
+        :func:`fill_features.compute_fill_features` — the shared
+        definition used by future inference (train/serve skew guard).
+        """
+        utc_now = datetime.fromtimestamp(wall_time, tz=timezone.utc)
+        record: Dict[str, Any] = {
+            "v": FEATURE_SCHEMA_VERSION,
+            "tid": raw_fill.get("tid"),
+            "oid": raw_fill.get("oid"),
+            "hash": raw_fill.get("hash"),
+            "ts": raw_fill.get("time"),
+            "ts_local": utc_now.isoformat(),
+            "coin": raw_fill.get("coin"),
+            "side": raw_fill.get("side"),
+            "is_maker": not raw_fill.get("crossed", False),
+            "direction": raw_fill.get("dir"),
+            "px": _to_float(raw_fill.get("px")),
+            "sz": _to_float(raw_fill.get("sz")),
+            "closed_pnl": _to_float(raw_fill.get("closedPnl")),
+            "fee": _to_float(raw_fill.get("fee")),
+        }
+        record.update(compute_fill_features(
+            md, utc_now,
+            realized_vol_bps=self._coin_vol.get(raw_fill.get("coin")),
+        ))
+        return record
+
+    # ------------------------------------------------------------------ #
+    #  Delayed sampling
+    # ------------------------------------------------------------------ #
+
+    def _sample_mid(self, snapshot: FillSnapshot, label: str) -> None:
+        """Delayed callback to sample mid price and compute adverse selection."""
+        if not self._running:
+            return
+        try:
+            md = self.market_data.get_market_data(snapshot.coin)
+            if not md or md.mid_price <= 0:
+                return
+
+            mid_now = md.mid_price
+            mid_at_fill = snapshot.mid_at_fill
+
+            # Adverse selection: how much did mid move AGAINST the filled side?
+            # BUY: we bought → mid going UP after = adverse (price moved away)
+            # SELL: we sold → mid going DOWN after = adverse
+            # Convention: negative = adverse, positive = favorable
+            direction = -1 if snapshot.side == "B" else 1
+            adverse_bps = direction * (mid_now - mid_at_fill) / mid_at_fill * 10_000
+            snapshot.samples[label] = adverse_bps
+
+            with self._lock:
+                self._aggregates[snapshot.coin][label].append(adverse_bps)
+
+            logger.debug(
+                "[adverse] %s %s %s: mid %.6f → %.6f = %+.1f bps",
+                label, snapshot.side, snapshot.coin,
+                mid_at_fill, mid_now, adverse_bps,
+            )
+
+        except Exception as e:
+            logger.error("[adverse] Error sampling mid for %s: %s", snapshot.coin, e)
+
+    # ------------------------------------------------------------------ #
+    #  Periodic summary
+    # ------------------------------------------------------------------ #
+
+    def maybe_log_summary(self) -> None:
+        """Log periodic summary if interval has elapsed.
+
+        Should be called from the main loop.
+        """
+        now = time.monotonic()
+        if now - self._last_log_time < self.log_interval:
+            return
+        self._last_log_time = now
+        self._log_summary()
+
+    def _log_summary(self) -> None:
+        """Log per-coin adverse selection summary and reset aggregates.
+
+        Also appends a snapshot to ``self._history[coin]`` so downstream
+        consumers (e.g. auto-exclude) can inspect the recent N windows.
+        """
+        with self._lock:
+            aggregates = dict(self._aggregates)
+            fill_counts = dict(self._fill_count)
+            self._aggregates = defaultdict(lambda: defaultdict(list))
+            self._fill_count = defaultdict(int)
+
+        if not aggregates:
+            return
+
+        snapshot_ts = time.time()
+        lines = [f"[adverse] Summary (last {self.log_interval:.0f}s):"]
+        for coin in sorted(aggregates.keys()):
+            fills = fill_counts.get(coin, 0)
+            parts = [f"  {coin}: fills={fills}"]
+            snapshot: Dict[str, Any] = {"ts": snapshot_ts, "fills": fills}
+            for label in SAMPLE_LABELS:
+                values = aggregates[coin].get(label, [])
+                if values:
+                    avg = sum(values) / len(values)
+                    parts.append(f"avg_{label}={avg:+.1f}bps")
+                    snapshot[f"avg_{label}"] = avg
+                else:
+                    parts.append(f"avg_{label}=n/a")
+                    snapshot[f"avg_{label}"] = None
+            lines.append("  ".join(parts))
+            with self._lock:
+                self._history[coin].append(snapshot)
+
+        logger.info("\n".join(lines))
+
+    # ------------------------------------------------------------------ #
+    #  Recent-window history (consumed by auto-exclude)
+    # ------------------------------------------------------------------ #
+
+    def get_recent_windows(self, coin: str, n: int) -> List[Dict[str, Any]]:
+        """Return up to the last ``n`` summary snapshots for ``coin``.
+
+        Each snapshot is a dict with keys ``ts``, ``fills``, ``avg_5s``,
+        ``avg_30s``, ``avg_60s``.  ``avg_*`` values may be ``None`` when
+        no fills produced a sample for that label in the window.
+        """
+        if n <= 0:
+            return []
+        with self._lock:
+            history = self._history.get(coin)
+            if not history:
+                return []
+            return list(history)[-n:]
+
+    # ------------------------------------------------------------------ #
+    #  Lifecycle
+    # ------------------------------------------------------------------ #
+
+    def stop(self) -> None:
+        """Stop tracker and log final summary."""
+        self._running = False
+        self._log_summary()
+        logger.info("[adverse] Stopped")
+
+    # ------------------------------------------------------------------ #
+    #  Observability
+    # ------------------------------------------------------------------ #
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    @property
+    def stats(self) -> Dict:
+        """Return current aggregate stats for external consumption."""
+        with self._lock:
+            result: Dict[str, Any] = {}
+            for coin, labels in self._aggregates.items():
+                coin_stats: Dict[str, Any] = {"fills": self._fill_count.get(coin, 0)}
+                for label in SAMPLE_LABELS:
+                    values = labels.get(label, [])
+                    if values:
+                        coin_stats[f"avg_{label}"] = sum(values) / len(values)
+                result[coin] = coin_stats
+            return result

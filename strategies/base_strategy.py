@@ -1,0 +1,342 @@
+from abc import ABC, abstractmethod
+from typing import Dict, List, Optional
+import logging
+import math
+import time
+import pandas as pd
+from market_data import MarketDataManager, MarketData
+from order_manager import OrderManager, OrderSide, round_price
+from position_closer import close_position_market
+from account_utils import get_account_snapshot
+from rate_limiter import API_ERRORS
+
+logger = logging.getLogger(__name__)
+
+
+class BaseStrategy(ABC):
+    def __init__(
+        self,
+        market_data_manager: MarketDataManager,
+        order_manager: OrderManager,
+        config: Dict
+    ) -> None:
+        self.market_data = market_data_manager
+        self.order_manager = order_manager
+        self.config = config
+        self.positions: Dict[str, Dict] = {}
+
+        # Heartbeat logging for observability (retained for backward compat)
+        self._heartbeat_interval: float = config.get('heartbeat_interval', 300)
+        self._last_heartbeat: float = 0.0
+        self._max_coin_status_display: int = config.get('max_coin_status_display', 10)
+
+    @abstractmethod
+    def generate_signals(self, coin: str) -> Optional[Dict]:
+        pass
+
+    def calculate_position_size(self, coin: str, signal: Dict) -> float:
+        """Calculate position size with common boilerplate.
+
+        Subclasses override ``_adjust_size_usd()`` to apply strategy-specific
+        dynamic sizing (e.g. RSI multiplier, ATR scaling).  The default
+        implementation can still be fully overridden for strategies that need
+        fundamentally different sizing logic (e.g. grid, market-making).
+        """
+        try:
+            if self._check_max_positions(coin):
+                return 0
+
+            market_data = self.market_data.get_market_data(coin)
+            if not market_data:
+                return 0
+
+            confidence = signal.get('confidence', 0.5)
+            base_size_usd = getattr(self, 'position_size_usd', 0) * confidence
+
+            base_size_usd = self._adjust_size_usd(base_size_usd, signal, market_data)
+
+            position_size = self._apply_account_cap(base_size_usd, market_data.mid_price)
+
+            log_detail = self._size_log_detail(signal)
+            logger.info(f"Calculated position size for {coin}: {position_size}{log_detail}")
+            return position_size
+
+        except API_ERRORS as e:
+            logger.error(f"Error calculating position size for {coin}: {e}")
+            return 0
+
+    def _adjust_size_usd(self, base_size_usd: float, signal: Dict,
+                         market_data: 'MarketData') -> float:
+        """Apply strategy-specific dynamic sizing. Override in subclasses."""
+        return base_size_usd
+
+    def _size_log_detail(self, signal: Dict) -> str:
+        """Return extra info to append to the position-size log line. Override in subclasses."""
+        return ""
+
+    # ------------------------------------------------------------------ #
+    # Signal validation
+    # ------------------------------------------------------------------ #
+
+    def _validate_signal(self, signal: Optional[Dict]) -> Optional[Dict]:
+        """Validate a signal dict. Return the signal if valid, or None."""
+        if not signal:
+            return None
+
+        # Validate side
+        side = signal.get('side')
+        if side not in ('buy', 'sell'):
+            logger.warning(f"Invalid signal side: {side!r} (must be 'buy' or 'sell')")
+            return None
+
+        # Validate confidence
+        confidence = signal.get('confidence', 0.5)
+        if not isinstance(confidence, (int, float)) or not math.isfinite(confidence):
+            logger.warning(f"Invalid signal confidence: {confidence!r} (must be a finite number)")
+            return None
+        if not (0.0 <= confidence <= 1.0):
+            logger.warning(f"Invalid signal confidence: {confidence!r} (must be in [0.0, 1.0])")
+            return None
+
+        # Validate order_type
+        order_type = signal.get('order_type', 'limit')
+        if order_type not in ('market', 'limit'):
+            logger.warning(f"Invalid signal order_type: {order_type!r} (must be 'market' or 'limit')")
+            return None
+
+        return signal
+
+    # ------------------------------------------------------------------ #
+    # Shared signal helpers
+    # ------------------------------------------------------------------ #
+
+    def _has_position(self, coin: str) -> bool:
+        """Return True if *coin* has a non-zero open position."""
+        return coin in self.positions and self.positions[coin]['size'] != 0
+
+    def _get_candles_or_none(self, coin: str, min_periods: int,
+                             interval: Optional[str] = None,
+                             lookback: Optional[int] = None) -> Optional[pd.DataFrame]:
+        """Fetch candles and return None if fewer than *min_periods* rows.
+
+        Any exception during the fetch is caught and logged so that a
+        single coin failure does not block the rest of the cycle.
+        """
+        ival = interval or getattr(self, 'candle_interval', '15m')
+        lb = lookback or getattr(self, 'lookback', min_periods + 10)
+        logger.debug(f"Fetching {lb} candles ({ival}) for {coin}")
+        try:
+            candles = self.market_data.get_candles(coin=coin, interval=ival, lookback=lb)
+        except (API_ERRORS, ValueError, KeyError) as e:
+            logger.warning(f"Failed to fetch candles for {coin}: {e}")
+            return None
+        logger.debug(f"Got {len(candles)} candles for {coin}")
+        if len(candles) < min_periods:
+            return None
+        return candles
+
+    # ------------------------------------------------------------------ #
+    # Shared position-sizing helpers
+    # ------------------------------------------------------------------ #
+
+    def _check_max_positions(self, coin: str) -> bool:
+        """Returns True (and logs) if already at max open positions for a new coin."""
+        max_pos = getattr(self, 'max_positions', None)
+        if max_pos is not None and len(self.positions) >= max_pos and coin not in self.positions:
+            logger.info(f"Max positions reached, skipping {coin}")
+            return True
+        return False
+
+    def _apply_account_cap(self, base_size_usd: float, mid_price: float, cap_pct: float = 0.1) -> float:
+        """
+        Convert a USD size to coin units, capping at cap_pct of account value.
+        With Portfolio Margin, spot stablecoin balances count as collateral.
+        """
+        try:
+            snapshot = get_account_snapshot(
+                self.order_manager.info,
+                self.order_manager.account_address,
+            )
+            if snapshot.account_value > 0:
+                max_size_usd = snapshot.account_value * cap_pct
+                if base_size_usd > max_size_usd:
+                    return max_size_usd / mid_price
+        except API_ERRORS as e:
+            logger.warning(f"Could not apply account cap: {e}")
+        return base_size_usd / mid_price
+
+    def execute_signal(self, coin: str, signal: Dict) -> None:
+        if not signal:
+            return
+
+        signal = self._validate_signal(signal)
+        if not signal:
+            return
+
+        try:
+            side = signal.get('side')
+            if not side:
+                return
+
+            position_size = self.calculate_position_size(coin, signal)
+            if position_size <= 0:
+                return
+
+            position_size = self.market_data.round_size(coin, position_size)
+
+            market_data = self.market_data.get_market_data(coin)
+            if not market_data:
+                logger.warning(f"No market data available for {coin}")
+                return
+
+            if signal.get('order_type') == 'market':
+                order = self.order_manager.create_market_order(
+                    coin=coin,
+                    side=OrderSide.BUY if side == 'buy' else OrderSide.SELL,
+                    size=position_size,
+                    reduce_only=signal.get('reduce_only', False)
+                )
+            else:
+                price = self._calculate_limit_price(market_data, side, coin)
+                order = self.order_manager.create_limit_order(
+                    coin=coin,
+                    side=OrderSide.BUY if side == 'buy' else OrderSide.SELL,
+                    size=position_size,
+                    price=price,
+                    reduce_only=signal.get('reduce_only', False),
+                    post_only=signal.get('post_only', True)
+                )
+
+            if order:
+                logger.info(f"Executed {side} order for {coin}: size={position_size}")
+
+        except API_ERRORS as e:
+            logger.error(f"Error executing signal for {coin}: {e}")
+
+    def _calculate_limit_price(self, market_data: MarketData, side: str,
+                               coin: Optional[str] = None) -> float:
+        sz_dec, perp = self.market_data.price_rounding_params(coin) if coin is not None else (0, True)
+        if side == 'buy':
+            return round_price(market_data.bid, sz_dec, perp)
+        else:
+            return round_price(market_data.ask, sz_dec, perp)
+
+    def update_positions(self) -> None:
+        self.positions = {}
+        all_positions = self.order_manager.get_all_positions()
+
+        for position in all_positions:
+            coin = position['coin']
+            self.positions[coin] = {
+                'size': float(position['szi']),
+                'entry_price': float(position['entryPx']),
+                'unrealized_pnl': float(position['unrealizedPnl']),
+                'margin_used': float(position['marginUsed'])
+            }
+
+    def should_close_position(self, coin: str) -> bool:
+        if coin not in self.positions:
+            return False
+
+        position = self.positions[coin]
+        market_data = self.market_data.get_market_data(coin)
+
+        if not market_data:
+            return False
+
+        pnl_percent = (position['unrealized_pnl'] / position['margin_used']) * 100
+
+        if pnl_percent >= self.config.get('take_profit_percent', 10):
+            logger.info(f"Take profit triggered for {coin}: {pnl_percent:.2f}%")
+            return True
+
+        if pnl_percent <= -self.config.get('stop_loss_percent', 5):
+            logger.info(f"Stop loss triggered for {coin}: {pnl_percent:.2f}%")
+            return True
+
+        return False
+
+    def close_position(self, coin: str) -> None:
+        position = self.positions.get(coin)
+        if not position:
+            return
+
+        # Verify position with fresh API data before sending reduce_only order.
+        # Cached self.positions may be stale if a WS fill closed the position
+        # between the last update_positions() and this call.
+        try:
+            fresh_positions = self.order_manager.get_all_positions()
+            fresh_pos = next((p for p in fresh_positions if p.get('coin') == coin), None)
+            if fresh_pos is None or abs(float(fresh_pos.get('szi', 0))) == 0:
+                logger.info(f"[mm] Position for {coin} already closed (fresh check), skipping close")
+                self.positions.pop(coin, None)
+                return
+            # Use fresh size for the close order
+            position = {'size': float(fresh_pos.get('szi', 0)), 'entry_price': position.get('entry_price', 0)}
+        except Exception as e:
+            logger.debug(f"[mm] Could not verify position for {coin}: {e}, using cached data")
+
+        close_position_market(
+            coin, position['size'], self.market_data, self.order_manager,
+        )
+
+    def run(self, coins: List[str]) -> None:
+        self.update_positions()
+
+        signals_generated = 0
+        signals_attempted = 0
+        coin_statuses = []
+
+        for coin in coins:
+            if self.should_close_position(coin):
+                self.close_position(coin)
+                coin_statuses.append(f"{coin}:close")
+            else:
+                signal = self.generate_signals(coin)
+                signal = self._validate_signal(signal)
+                if signal:
+                    signals_generated += 1
+                    self.execute_signal(coin, signal)
+                    signals_attempted += 1
+                    coin_statuses.append(f"{coin}:{signal.get('side', '?')}")
+                else:
+                    coin_statuses.append(f"{coin}:{self._coin_status(coin)}")
+
+        pos_count = len(self.positions)
+
+        # Per-cycle log with coin-level status (truncated for large lists)
+        if len(coin_statuses) <= self._max_coin_status_display:
+            status_str = " | ".join(coin_statuses)
+        else:
+            shown = coin_statuses[:self._max_coin_status_display]
+            status_str = " | ".join(shown) + f" ... +{len(coin_statuses) - self._max_coin_status_display} more"
+        logger.info(
+            f"[cycle] {len(coins)} coins, {signals_generated} signals, "
+            f"{pos_count} pos | {status_str}"
+        )
+
+        # Periodic heartbeat (retained for backward compatibility with
+        # monitoring tools that grep for "[heartbeat]")
+        self._log_heartbeat(len(coins), signals_generated, signals_attempted)
+
+    def _log_heartbeat(self, coins_checked: int, signals_generated: int,
+                       signals_attempted: int) -> None:
+        """Emit a periodic ``[heartbeat]`` log line for monitoring tools."""
+        now = time.monotonic()
+        if now - self._last_heartbeat < self._heartbeat_interval:
+            return
+        self._last_heartbeat = now
+        pos_count = len(self.positions)
+        logger.info(
+            f"[heartbeat] {coins_checked} coins checked, "
+            f"{signals_generated} signals, {signals_attempted} attempted, "
+            f"{pos_count} positions"
+        )
+
+    def _coin_status(self, coin: str) -> str:
+        """Return a short status string for a coin with no signal.
+
+        Subclasses can override to provide strategy-specific details
+        (e.g. RSI value, grid fill count).
+        """
+        return "idle"

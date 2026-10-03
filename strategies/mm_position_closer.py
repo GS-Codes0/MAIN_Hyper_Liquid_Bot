@@ -1,0 +1,753 @@
+"""Position close management for market-making strategy.
+
+Handles take-profit placement, max-age force-close, and taker fallback logic.
+
+Close orders are progressively tightened as positions age to increase maker
+fill probability before the expensive taker fallback kicks in:
+  - Before 50% of max age: full take-profit spread
+  - 50%-75% of max age: breakeven (0 bps)
+  - 75%-100% of max age: small loss (-1 bps) to encourage fill
+"""
+
+import logging
+import time
+from collections import defaultdict
+from typing import Any, Dict, Optional, Tuple
+
+from coin_utils import parse_coin
+from order_manager import BBO_OFFSET, OrderSide, round_price
+from rate_limiter import API_ERRORS
+from strategies.mm_config import CloseTierToxicityConfig
+
+logger = logging.getLogger(__name__)
+
+# Close price tiers by position age fraction
+_TIER_NORMAL = 0       # full take-profit spread
+_TIER_BREAKEVEN = 1    # 0 bps (breakeven)
+_TIER_AGGRESSIVE = 2   # -1 bps (accept small loss)
+
+# Clear stale position tracking after this many consecutive close failures
+_GHOST_CLEAR_THRESHOLD = 5
+
+# Human-readable tier names for logging
+_TIER_NAMES = {_TIER_NORMAL: "normal", _TIER_BREAKEVEN: "breakeven", _TIER_AGGRESSIVE: "aggressive"}
+
+# Close reason constants
+CLOSE_REASON_MAKER = "maker"           # closed by maker close order fill
+CLOSE_REASON_TAKER_AGE = "taker_age"   # force closed by taker (age exceeded)
+CLOSE_REASON_EXTERNAL = "external"     # closed externally (e.g. risk manager)
+CLOSE_REASON_UNREALIZED_LOSS = "unrealized_loss"  # early taker close on unrealized loss threshold
+
+
+class PositionCloser:
+    """Manages close orders for filled market-making positions."""
+
+    def __init__(
+        self,
+        order_manager,
+        market_data,
+        *,
+        spread_bps: float,
+        max_position_age_seconds: float,
+        maker_only: bool,
+        taker_fallback_age_seconds: Optional[float],
+        aggressive_loss_bps: float = 1.0,
+        force_close_max_loss_bps: float = 0.0,
+        coin_spread_overrides: Optional[Dict[str, float]] = None,
+        close_spread_bps: Optional[float] = None,
+        close_breakeven_pct: float = 0.50,
+        close_aggressive_pct: float = 0.75,
+        unrealized_loss_close_bps: float = 0.0,
+        coin_unrealized_loss_overrides: Optional[Dict[str, float]] = None,
+        coin_close_tier_overrides: Optional[Dict[str, Tuple[float, float]]] = None,
+        close_tier_toxicity: Optional[CloseTierToxicityConfig] = None,
+        close_tier_min_seconds: float = 0.0,
+    ) -> None:
+        self.order_manager = order_manager
+        self.market_data = market_data
+        self.spread_bps = spread_bps
+        self._coin_spread_overrides: Dict[str, float] = coin_spread_overrides or {}
+        self.max_position_age_seconds = max_position_age_seconds
+        self.maker_only = maker_only
+        self.taker_fallback_age_seconds = taker_fallback_age_seconds
+        self.aggressive_loss_bps = aggressive_loss_bps
+        # 0 = disabled (use BBO-only pricing in force close phase)
+        self.force_close_max_loss_bps = max(force_close_max_loss_bps, aggressive_loss_bps) \
+            if force_close_max_loss_bps > 0 else 0.0
+        # Close-specific spread (None = use entry spread_bps for backward compat)
+        self.close_spread_bps = close_spread_bps if close_spread_bps is not None else spread_bps
+        # Tier transition timing (fraction of max_position_age)
+        self.close_breakeven_pct = close_breakeven_pct
+        self.close_aggressive_pct = close_aggressive_pct
+        # Unrealized loss early close (0 = disabled)
+        self.unrealized_loss_close_bps = unrealized_loss_close_bps
+        # Per-coin overrides for unrealized_loss_close_bps. Empty dict = no
+        # overrides (every coin uses the global threshold). Lookup falls back
+        # to bare coin name (e.g. "NVDA") if the DEX-prefixed key
+        # ("xyz:NVDA") is not found.
+        self._coin_unrealized_loss_overrides: Dict[str, float] = coin_unrealized_loss_overrides or {}
+        # Per-coin close tier overrides: coin -> (breakeven_pct, aggressive_pct).
+        # Same full-name -> bare-name lookup as the other per-coin overrides.
+        self._coin_close_tier_overrides: Dict[str, Tuple[float, float]] = \
+            coin_close_tier_overrides or {}
+        # Toxicity-linked tier acceleration (None or disabled = base behaviour).
+        # The tracker is injected by bot.py via set_adverse_tracker() after
+        # WS setup — same pattern as the strategy's dynamic offset.
+        self._toxicity_config = close_tier_toxicity
+        self._adverse_tracker: Optional[Any] = None
+        # coin -> last acceleration state, for state-transition-only logging
+        self._tox_active: Dict[str, bool] = {}
+        # Absolute floor (seconds) for the breakeven transition (0 = disabled)
+        self.close_tier_min_seconds = close_tier_min_seconds
+
+        # coin -> (entry_time, close_oid or None, close_tier)
+        self._open_positions: Dict[str, Tuple[float, Optional[int], int]] = {}
+        # coin -> consecutive cycles where manage() failed to place a close order
+        self._consecutive_close_failures: Dict[str, int] = {}
+        # coin -> last effective_max_age seen by manage(); used so close-event
+        # records driven from outside manage() (cleanup_closed,
+        # on_position_closed) can still report the dynamic max_age the bot
+        # was using at the moment the position was alive.
+        self._last_effective_max_age: Dict[str, float] = {}
+
+        # Close reason statistics: reason -> count, coin-level: (coin, reason) -> count
+        self._close_stats: Dict[str, int] = defaultdict(int)
+        self._close_stats_by_coin: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        self._close_stats_log_interval: float = 300.0
+        self._last_close_stats_log: float = 0.0
+
+    @property
+    def tracked_coins(self) -> set:
+        return set(self._open_positions.keys())
+
+    @property
+    def close_stats(self) -> Dict[str, int]:
+        """Read-only access to close reason counters."""
+        return dict(self._close_stats)
+
+    def _record_close(
+        self,
+        coin: str,
+        reason: str,
+        age: float,
+        tier: int,
+        effective_max_age: Optional[float] = None,
+    ) -> None:
+        """Record a position close event with reason and context.
+
+        ``effective_max_age`` is the max-age the bot was using when the
+        close fired (post-DYNAMIC_AGE). Appended as ``max_age=Ns`` to
+        the log line so post-hoc analysis can tell whether a long
+        ``age`` was driven by a small ``effective_max_age`` (DYNAMIC_AGE
+        clamped low) or by the full grace window. Optional and
+        backward-compatible — the existing log regex
+        ``last_tier=(\\S+)`` still matches the same group.
+        """
+        self._close_stats[reason] += 1
+        self._close_stats_by_coin[coin][reason] += 1
+        tier_name = _TIER_NAMES.get(tier, f"tier{tier}")
+        suffix = f" max_age={effective_max_age:.0f}s" if effective_max_age is not None else ""
+        logger.info(
+            f"[close-reason] {coin} reason={reason} age={age:.0f}s "
+            f"last_tier={tier_name}{suffix}"
+        )
+
+    def log_close_stats(self) -> None:
+        """Log close reason summary periodically. Called from strategy run()."""
+        now = time.monotonic()
+        if now - self._last_close_stats_log < self._close_stats_log_interval:
+            return
+        self._last_close_stats_log = now
+
+        total = sum(self._close_stats.values())
+        if total == 0:
+            return
+
+        parts = [f"{reason}={count}" for reason, count in sorted(self._close_stats.items())]
+        logger.info(f"[close-reason] Summary: total={total} {' '.join(parts)}")
+
+        # Per-coin breakdown for taker closes
+        taker_coins = []
+        for coin, reasons in sorted(self._close_stats_by_coin.items()):
+            taker = reasons.get(CLOSE_REASON_TAKER_AGE, 0)
+            if taker > 0:
+                maker = reasons.get(CLOSE_REASON_MAKER, 0)
+                total_coin = taker + maker + reasons.get(CLOSE_REASON_EXTERNAL, 0)
+                taker_pct = taker / total_coin * 100 if total_coin > 0 else 0
+                taker_coins.append(f"{coin}={taker}/{total_coin}({taker_pct:.0f}%)")
+        if taker_coins:
+            logger.info(f"[close-reason] Taker closes by coin: {' '.join(taker_coins)}")
+
+        # Reset counters
+        self._close_stats.clear()
+        self._close_stats_by_coin.clear()
+
+    def get_close_oid(self, coin: str) -> Optional[int]:
+        """Return the close order OID for a coin, or None."""
+        entry = self._open_positions.get(coin)
+        return entry[1] if entry else None
+
+    def cleanup_closed(self, coin: str) -> None:
+        """Clean up tracking when a position has been closed (maker fill or external)."""
+        if coin not in self._open_positions:
+            return
+        entry_time, close_oid, tier = self._open_positions[coin]
+        age = time.monotonic() - entry_time
+        effective_max_age = self._last_effective_max_age.get(coin)
+        # Position was closed while we had a close order → likely maker fill
+        if close_oid is not None:
+            self._record_close(coin, CLOSE_REASON_MAKER, age, tier,
+                               effective_max_age=effective_max_age)
+            try:
+                self.order_manager.cancel_order(close_oid, coin)
+            except API_ERRORS as e:
+                logger.debug(f"[mm] Could not cancel leftover close order for {coin}: {e}")
+        else:
+            # No close order was pending → external close (risk manager, etc.)
+            self._record_close(coin, CLOSE_REASON_EXTERNAL, age, tier,
+                               effective_max_age=effective_max_age)
+        self._open_positions.pop(coin, None)
+        self._consecutive_close_failures.pop(coin, None)
+        self._last_effective_max_age.pop(coin, None)
+
+    def invalidate_close_order(self, coin: str) -> bool:
+        """Cancel and clear the current close order so manage() re-places it.
+
+        Called by CloseRefreshGuard when BBO changes significantly.
+        Returns True if a close order was actually cancelled.
+
+        Thread-safe: may be called from the WS thread.
+        """
+        entry = self._open_positions.get(coin)
+        if entry is None:
+            return False
+
+        entry_time, close_oid, tier = entry
+        if close_oid is None:
+            return False
+
+        try:
+            self.order_manager.cancel_order(close_oid, coin)
+        except Exception as e:
+            logger.debug(f"[mm] Could not cancel close order for {coin} (refresh): {e}")
+
+        self._open_positions[coin] = (entry_time, None, tier)
+        logger.info(
+            f"[mm] Invalidated close order {close_oid} for {coin} "
+            f"(BBO refresh, tier={tier}, age={time.monotonic() - entry_time:.0f}s)"
+        )
+        return True
+
+    def on_position_closed(self, coin: str) -> None:
+        """Remove tracking after an immediate close."""
+        entry = self._open_positions.get(coin)
+        if entry is not None:
+            entry_time, close_oid, tier = entry
+            age = time.monotonic() - entry_time
+            reason = CLOSE_REASON_MAKER if close_oid is not None else CLOSE_REASON_EXTERNAL
+            effective_max_age = self._last_effective_max_age.get(coin)
+            self._record_close(coin, reason, age, tier,
+                               effective_max_age=effective_max_age)
+        self._open_positions.pop(coin, None)
+        self._consecutive_close_failures.pop(coin, None)
+        self._last_effective_max_age.pop(coin, None)
+
+    def manage(self, coin: str, position: Dict, close_position_fn,
+               max_age_override: Optional[float] = None) -> None:
+        """Manage take-profit close for an open position.
+
+        Parameters
+        ----------
+        coin : str
+        position : dict with 'size' and 'entry_price' keys
+        close_position_fn : callable(coin) that market-closes the position
+        max_age_override : float, optional
+            If provided, overrides ``max_position_age_seconds`` for this call.
+            Used by volatility-adjusted dynamic age.
+        """
+        size = position.get('size', 0)
+        if abs(size) == 0:
+            # Position already closed externally -- cancel orphaned close order and clean up
+            self.cleanup_closed(coin)
+            return
+        entry_price = position['entry_price']
+        now = time.monotonic()
+
+        # Register position if not tracked
+        if coin not in self._open_positions:
+            self._open_positions[coin] = (now, None, _TIER_NORMAL)
+            logger.info(f"[mm] Tracking position for {coin}: size={size:.6f} entry={entry_price:.4f}")
+
+        entry_time, close_oid, current_tier = self._open_positions[coin]
+        age = now - entry_time
+        effective_max_age = max_age_override if max_age_override is not None else self.max_position_age_seconds
+        # Snapshot for close-event logging from cleanup_closed /
+        # on_position_closed paths that don't otherwise know it.
+        self._last_effective_max_age[coin] = effective_max_age
+
+        # Unrealized loss early close: taker close when loss exceeds threshold.
+        # Uses the per-coin override if present, else the global threshold.
+        unrealized_loss_threshold = self._get_unrealized_loss_bps_for_coin(coin)
+        if unrealized_loss_threshold > 0 and entry_price > 0:
+            md = self.market_data.get_market_data(coin)
+            if md and md.mid_price > 0:
+                if size > 0:  # long
+                    unrealized_bps = (entry_price - md.mid_price) / entry_price * 10_000
+                else:  # short
+                    unrealized_bps = (md.mid_price - entry_price) / entry_price * 10_000
+
+                if unrealized_bps >= unrealized_loss_threshold:
+                    # Cancel existing close order
+                    if close_oid is not None:
+                        try:
+                            self.order_manager.cancel_order(close_oid, coin)
+                        except API_ERRORS:
+                            pass
+
+                    # Verify position still exists (WS fill may have closed it)
+                    if coin not in self._open_positions:
+                        return
+
+                    logger.warning(
+                        f"[mm] Position {coin} unrealized loss {unrealized_bps:.1f}bps "
+                        f"exceeds threshold {unrealized_loss_threshold}bps -- "
+                        f"early taker close (age={age:.0f}s)"
+                    )
+                    self._record_close(coin, CLOSE_REASON_UNREALIZED_LOSS, age, current_tier,
+                                       effective_max_age=effective_max_age)
+                    close_position_fn(coin)
+                    self._open_positions.pop(coin, None)
+                    self._last_effective_max_age.pop(coin, None)
+                    return
+
+        # Check if max age exceeded -- force close
+        if age >= effective_max_age:
+            self._handle_force_close(coin, size, age, entry_time, close_oid, close_position_fn,
+                                     entry_price=entry_price, current_tier=current_tier,
+                                     max_age=effective_max_age)
+            return
+
+        # Determine desired tier for this age
+        desired_tier = self._get_tier(coin, age, max_age=effective_max_age)
+
+        # Check if close order is still alive
+        if close_oid is not None:
+            if self._is_order_alive(coin, close_oid):
+                # If tier changed, cancel and re-place at tighter price
+                if desired_tier > current_tier:
+                    try:
+                        self.order_manager.cancel_order(close_oid, coin)
+                    except API_ERRORS as e:
+                        logger.debug(
+                            f"[mm] Could not cancel close order for tightening {coin}: {e}"
+                        )
+                        return
+                    self._open_positions[coin] = (entry_time, None, desired_tier)
+                    logger.info(
+                        f"[mm] Tightening close for {coin} at age {age:.0f}s "
+                        f"(tier {current_tier} -> {desired_tier})"
+                    )
+                else:
+                    return  # Close order still active at correct tier, wait
+            else:
+                # Close order was filled or cancelled — defer to next cycle
+                # to let update_positions() refresh before re-placing.
+                # This prevents reduce-only rejections from stale position data.
+                self._open_positions[coin] = (entry_time, None, current_tier)
+                logger.debug(
+                    f"[mm] Close order {close_oid} for {coin} no longer alive, "
+                    f"deferring re-place to next cycle"
+                )
+                return
+
+        # Place take-profit close order with price based on position age
+        placed = self._place_take_profit(coin, size, entry_price, entry_time, desired_tier)
+
+        # Auto-clear stale tracking after repeated failures to place a close order.
+        # This handles ghost positions where the exchange has closed the position
+        # but stale cached data causes the bot to keep trying to close it.
+        # Only count when placement was actually attempted (not skipped due to size rounding).
+        entry = self._open_positions.get(coin)
+        if placed and entry and entry[1] is None:
+            count = self._consecutive_close_failures.get(coin, 0) + 1
+            self._consecutive_close_failures[coin] = count
+            if count >= _GHOST_CLEAR_THRESHOLD:
+                logger.warning(
+                    f"[mm] {coin}: {count} consecutive close failures "
+                    "— clearing stale position tracking (ghost position)"
+                )
+                self._open_positions.pop(coin, None)
+                self._consecutive_close_failures.pop(coin, None)
+        else:
+            self._consecutive_close_failures.pop(coin, None)
+
+    def _handle_force_close(
+        self, coin: str, size: float, age: float,
+        entry_time: float, close_oid: Optional[int],
+        close_position_fn, entry_price: float = 0.0,
+        current_tier: int = _TIER_NORMAL,
+        max_age: Optional[float] = None,
+    ) -> None:
+        # Cancel existing close order if any
+        if close_oid is not None:
+            try:
+                self.order_manager.cancel_order(close_oid, coin)
+            except API_ERRORS as e:
+                logger.debug(f"[mm] Could not cancel close order for {coin}: {e}")
+
+        # Verify position still exists before force close.
+        # WS fill feed may have closed the position between the last
+        # update_positions() cycle and this force-close attempt.
+        try:
+            positions = self.order_manager.get_all_positions()
+            pos = next((p for p in positions if p.get('coin') == coin), None)
+            if pos is None or abs(float(pos.get('szi', 0))) == 0:
+                logger.info(
+                    f"[mm] Position for {coin} already closed before force close "
+                    f"(age={age:.0f}s) — skipping"
+                )
+                self._open_positions.pop(coin, None)
+                self._consecutive_close_failures.pop(coin, None)
+                return
+        except Exception as e:
+            logger.debug(f"[mm] Could not verify position for {coin} before force close: {e}")
+            # Proceed — better to get a rejection than miss a real force close
+
+        # Check if taker fallback should be used
+        effective_max_age = max_age if max_age is not None else self.max_position_age_seconds
+        use_taker = False
+        if not self.maker_only:
+            use_taker = True
+        elif self.taker_fallback_age_seconds is not None:
+            taker_deadline = effective_max_age + self.taker_fallback_age_seconds
+            if age >= taker_deadline:
+                use_taker = True
+
+        if use_taker:
+            # Final guard: FillFeed may have already closed this position on the WS thread.
+            # _open_positions is updated by on_position_closed() with no cache delay,
+            # unlike get_all_positions() which has a 2-second TTL cache.
+            if coin not in self._open_positions:
+                logger.info(f"[mm] Position {coin} already closed (WS fill) before taker force close")
+                return
+            tier_name = _TIER_NAMES.get(current_tier, f"tier{current_tier}")
+            logger.warning(
+                f"[mm] Position {coin} held {age:.0f}s -- force closing with taker order "
+                f"(last_tier={tier_name}, had_close_order={close_oid is not None})"
+            )
+            self._record_close(coin, CLOSE_REASON_TAKER_AGE, age, current_tier,
+                               effective_max_age=effective_max_age)
+            close_position_fn(coin)
+            self._open_positions.pop(coin, None)
+            self._last_effective_max_age.pop(coin, None)
+            return
+
+        # Maker-only close with progressive loss acceptance
+        market_data = self.market_data.get_market_data(coin)
+        if not market_data or market_data.mid_price <= 0:
+            logger.info(f"[mm] Position {coin} held {age:.0f}s — no market data, skipping maker close")
+            return
+
+        rp = self.market_data.price_rounding_params(coin)
+        close_side = OrderSide.SELL if size > 0 else OrderSide.BUY
+
+        if not (market_data.bid > 0 and market_data.ask > 0):
+            logger.info(f"[mm] Position {coin} held {age:.0f}s — no BBO, skipping maker close")
+            return
+
+        # BBO-based price (always available)
+        if close_side == OrderSide.SELL:
+            bbo_price = round_price(market_data.ask * (1 + BBO_OFFSET), *rp)
+        else:
+            bbo_price = round_price(market_data.bid * (1 - BBO_OFFSET), *rp)
+
+        close_price = bbo_price
+        loss_bps = self.aggressive_loss_bps
+
+        # Dynamic loss acceptance: scale from aggressive_loss_bps to
+        # force_close_max_loss_bps as position approaches taker deadline.
+        if self.force_close_max_loss_bps > 0 and entry_price > 0 and self.taker_fallback_age_seconds:
+            progress = (age - effective_max_age) / self.taker_fallback_age_seconds
+            progress = min(max(progress, 0.0), 1.0)
+            loss_bps = (self.aggressive_loss_bps
+                        + progress * (self.force_close_max_loss_bps - self.aggressive_loss_bps))
+
+            if close_side == OrderSide.SELL:
+                entry_price_adjusted = round_price(entry_price * (1 - loss_bps / 10_000), *rp)
+                # Use the more aggressive of entry-based and BBO-based
+                close_price = min(entry_price_adjusted, bbo_price)
+                # Clamp to stay outside BBO for maker-only
+                if close_price <= market_data.ask:
+                    close_price = bbo_price
+            else:
+                entry_price_adjusted = round_price(entry_price * (1 + loss_bps / 10_000), *rp)
+                close_price = max(entry_price_adjusted, bbo_price)
+                if close_price >= market_data.bid:
+                    close_price = bbo_price
+
+        abs_size = self.market_data.round_size(coin, abs(size))
+        if abs_size > 0:
+            # Final guard before reduce_only order (same as taker path above)
+            if coin not in self._open_positions:
+                logger.info(f"[mm] Position {coin} already closed (WS fill) before maker force close")
+                return
+            try:
+                order = self.order_manager.create_limit_order(
+                    coin=coin, side=close_side, size=abs_size,
+                    price=close_price, reduce_only=True, post_only=True,
+                )
+                if order and order.id is not None:
+                    self._open_positions[coin] = (entry_time, order.id, _TIER_AGGRESSIVE)
+                    if self.force_close_max_loss_bps > 0 and entry_price > 0:
+                        logger.info(
+                            f"[mm] Position {coin} held {age:.0f}s -- "
+                            f"maker close at {close_price:.6f} loss={loss_bps:.1f}bps (oid={order.id})"
+                        )
+                    else:
+                        logger.info(
+                            f"[mm] Position {coin} held {age:.0f}s -- "
+                            f"maker close at {close_price:.6f} (oid={order.id})"
+                        )
+                    return
+            except API_ERRORS as e:
+                logger.debug(f"[mm] Maker close failed for {coin}: {e}")
+
+        logger.info(f"[mm] Position {coin} held {age:.0f}s -- maker close pending, will retry next cycle")
+
+    def _get_spread_for_coin(self, coin: str) -> float:
+        """Get spread_bps for a specific coin, checking overrides first."""
+        if coin in self._coin_spread_overrides:
+            return self._coin_spread_overrides[coin]
+        _, bare = parse_coin(coin)
+        if bare in self._coin_spread_overrides:
+            return self._coin_spread_overrides[bare]
+        return self.spread_bps
+
+    def _get_unrealized_loss_bps_for_coin(self, coin: str) -> float:
+        """Return the unrealized-loss early-close threshold (bps) for a coin.
+
+        Falls back to the global ``unrealized_loss_close_bps`` when no
+        override is set. Same DEX-prefix-or-bare lookup as
+        ``_get_spread_for_coin``. Returning 0 from an override disables
+        the feature for that coin (the caller gates on ``> 0``).
+        """
+        if coin in self._coin_unrealized_loss_overrides:
+            return self._coin_unrealized_loss_overrides[coin]
+        _, bare = parse_coin(coin)
+        if bare in self._coin_unrealized_loss_overrides:
+            return self._coin_unrealized_loss_overrides[bare]
+        return self.unrealized_loss_close_bps
+
+    def set_adverse_tracker(self, tracker: Any) -> None:
+        """Register the AdverseSelectionTracker for toxicity-linked tiers.
+
+        Called by bot.py after WS setup when ``close_tier_toxicity_enabled``
+        is set — same injection pattern as the strategy's dynamic offset.
+        """
+        self._adverse_tracker = tracker
+
+    def _get_tier_pcts_for_coin(self, coin: str) -> Tuple[float, float]:
+        """Return ``(breakeven_pct, aggressive_pct)`` for a coin.
+
+        Falls back to the global values when no override is set. Same
+        DEX-prefix-or-bare lookup as ``_get_unrealized_loss_bps_for_coin``.
+        """
+        if coin in self._coin_close_tier_overrides:
+            return self._coin_close_tier_overrides[coin]
+        _, bare = parse_coin(coin)
+        if bare in self._coin_close_tier_overrides:
+            return self._coin_close_tier_overrides[bare]
+        return (self.close_breakeven_pct, self.close_aggressive_pct)
+
+    def _apply_toxicity_accel(
+        self, coin: str, b_pct: float, a_pct: float,
+    ) -> Tuple[float, float]:
+        """Shrink tier percentages when recent markout indicates toxic flow.
+
+        Reads the tracker's current window first; when the window was just
+        reset and holds too few fills, falls back to the last completed
+        window (``get_recent_windows``), rejected when older than twice the
+        tracker's log interval. Any missing data — tracker absent, too few
+        fills, no sample for the configured label, stale snapshot — falls
+        through to base behaviour (fail-safe).
+        """
+        cfg = self._toxicity_config
+        if cfg is None or not cfg.enabled or self._adverse_tracker is None:
+            return b_pct, a_pct
+
+        key = f"avg_{cfg.window}"
+        avg = None
+        coin_stats = self._adverse_tracker.stats.get(coin)
+        if coin_stats and coin_stats.get("fills", 0) >= cfg.min_fills:
+            avg = coin_stats.get(key)
+        else:
+            # Current window just reset — look at the last completed window.
+            # Bounded by wall-clock age so an idle coin's hours-old snapshot
+            # cannot keep driving acceleration (history only refreshes for
+            # coins that had fills in a window).
+            recent = self._adverse_tracker.get_recent_windows(coin, n=1)
+            if recent and (recent[-1].get("fills") or 0) >= cfg.min_fills:
+                max_snapshot_age = 2.0 * getattr(self._adverse_tracker, 'log_interval', 300.0)
+                ts = recent[-1].get("ts")
+                if ts is not None and (time.time() - ts) <= max_snapshot_age:
+                    avg = recent[-1].get(key)
+
+        # Negative markout = adverse; fire at or below the threshold
+        if avg is None or avg > cfg.threshold_bps:
+            self._log_tox_state(coin, active=False)
+            return b_pct, a_pct
+
+        # floor_pct guards against over-shortening, but must never push the
+        # effective pcts ABOVE the base (acceleration may not loosen tiers —
+        # e.g. a pure-scratch override b_pct=0.0 stays at 0.0 while toxic).
+        eff_b = max(b_pct * cfg.multiplier, min(cfg.floor_pct, b_pct))
+        eff_a = max(a_pct * cfg.multiplier, eff_b)
+        self._log_tox_state(coin, active=True, avg=avg,
+                            pcts=(b_pct, a_pct, eff_b, eff_a))
+        return eff_b, eff_a
+
+    def _log_tox_state(
+        self, coin: str, active: bool,
+        avg: Optional[float] = None,
+        pcts: Optional[Tuple[float, float, float, float]] = None,
+    ) -> None:
+        """Log toxicity acceleration state transitions (ON/OFF) once each."""
+        prev = self._tox_active.get(coin, False)
+        if active == prev:
+            return
+        self._tox_active[coin] = active
+        if active and pcts is not None:
+            b, a, eff_b, eff_a = pcts
+            window = self._toxicity_config.window if self._toxicity_config else "?"
+            logger.info(
+                f"[close-tier] {coin} toxicity accel ON avg_{window}={avg:+.1f}bps "
+                f"pcts {b:.2f}/{a:.2f} -> {eff_b:.2f}/{eff_a:.2f}"
+            )
+        else:
+            logger.info(f"[close-tier] {coin} toxicity accel OFF")
+
+    def _get_tier(self, coin: str, age: float, max_age: Optional[float] = None) -> int:
+        """Return the close price tier for the given position age."""
+        effective_max_age = max_age if max_age is not None else self.max_position_age_seconds
+        b_pct, a_pct = self._get_tier_pcts_for_coin(coin)
+        b_pct, a_pct = self._apply_toxicity_accel(coin, b_pct, a_pct)
+
+        threshold_breakeven = effective_max_age * b_pct
+        threshold_aggressive = effective_max_age * a_pct
+        if self.close_tier_min_seconds > 0:
+            # Absolute floor against dynamic_age x override x toxicity stacking
+            threshold_breakeven = max(threshold_breakeven, self.close_tier_min_seconds)
+            threshold_aggressive = max(threshold_aggressive, threshold_breakeven)
+
+        if age >= threshold_aggressive:
+            return _TIER_AGGRESSIVE
+        elif age >= threshold_breakeven:
+            return _TIER_BREAKEVEN
+        else:
+            return _TIER_NORMAL
+
+    def _tier_spread_bps(self, tier: int) -> float:
+        """Return the spread in bps for a given close tier."""
+        if tier == _TIER_NORMAL:
+            return self.close_spread_bps
+        elif tier == _TIER_BREAKEVEN:
+            return 0.0
+        else:
+            return -self.aggressive_loss_bps
+
+    def _place_take_profit(
+        self, coin: str, size: float, entry_price: float,
+        entry_time: float, tier: int,
+    ) -> bool:
+        """Place a take-profit close order. Returns True if placement was attempted."""
+        # Verify position still exists before placing reduce_only order.
+        # Catches races where the position closed between update_positions()
+        # and this call (e.g., close fill detected via WS).
+        try:
+            positions = self.order_manager.get_all_positions()
+            pos = next((p for p in positions if p.get('coin') == coin), None)
+            if pos is None or abs(float(pos.get('szi', 0))) == 0:
+                logger.info(f"[mm] Position for {coin} already closed, skipping close order")
+                self._open_positions.pop(coin, None)
+                self._consecutive_close_failures.pop(coin, None)
+                return False
+        except Exception:
+            pass  # Proceed with placement — rejection is safer than missing a close
+
+        coin_spread = self._get_spread_for_coin(coin)
+        effective_spread = self._tier_spread_bps(tier) if coin_spread == self.close_spread_bps else (
+            coin_spread if tier == _TIER_NORMAL else 0.0 if tier == _TIER_BREAKEVEN else -self.aggressive_loss_bps
+        )
+        age = time.monotonic() - entry_time
+
+        rp = self.market_data.price_rounding_params(coin)
+
+        close_side = OrderSide.SELL if size > 0 else OrderSide.BUY
+
+        # Entry-based close price
+        if size > 0:
+            entry_close = round_price(entry_price * (1 + effective_spread / 10_000), *rp)
+        else:
+            entry_close = round_price(entry_price * (1 - effective_spread / 10_000), *rp)
+
+        # BBO-tracking: use the more aggressive of entry-based and BBO-based price
+        close_price = entry_close
+        md = self.market_data.get_market_data(coin)
+        try:
+            has_bbo = md is not None and md.bid > 0 and md.ask > 0
+        except (TypeError, AttributeError):
+            has_bbo = False
+        if has_bbo:
+            if close_side == OrderSide.SELL:
+                bbo_close = round_price(md.ask * (1 + BBO_OFFSET), *rp)
+                close_price = min(entry_close, bbo_close)
+            else:
+                bbo_close = round_price(md.bid * (1 - BBO_OFFSET), *rp)
+                close_price = max(entry_close, bbo_close)
+
+            # Maker-only clamp: ensure price stays outside BBO
+            if self.maker_only:
+                if close_side == OrderSide.SELL and close_price <= md.ask:
+                    close_price = round_price(md.ask * (1 + BBO_OFFSET), *rp)
+                elif close_side == OrderSide.BUY and close_price >= md.bid:
+                    close_price = round_price(md.bid * (1 - BBO_OFFSET), *rp)
+
+        abs_size = self.market_data.round_size(coin, abs(size))
+        if abs_size <= 0:
+            return False  # Size rounding issue, not a placement failure
+
+        # Final guard: WS fill may have closed position between manage() and here
+        if coin not in self._open_positions:
+            logger.info(f"[mm] Position {coin} already closed (WS fill) before take-profit placement")
+            return False
+
+        try:
+            order = self.order_manager.create_limit_order(
+                coin=coin, side=close_side, size=abs_size,
+                price=close_price, reduce_only=True, post_only=self.maker_only,
+            )
+            if order and order.id is not None:
+                self._open_positions[coin] = (entry_time, order.id, tier)
+                spread_label = (
+                    "take-profit" if effective_spread > 0
+                    else "breakeven" if effective_spread == 0
+                    else "loss-cut"
+                )
+                logger.info(
+                    f"[mm] Placed {spread_label} {close_side.value} for {coin} "
+                    f"size={abs_size} price={close_price:.6f} "
+                    f"spread={effective_spread:.1f}bps age={age:.0f}s (oid={order.id})"
+                )
+                return True
+        except API_ERRORS as e:
+            logger.error(f"[mm] Failed to place close order for {coin}: {e}")
+        return True  # Placement was attempted even if it failed
+
+    def _is_order_alive(self, coin: str, oid: int) -> bool:
+        try:
+            open_orders = self.order_manager.get_open_orders(coin)
+            open_oids = {int(o['oid']) for o in open_orders}
+            return oid in open_oids
+        except API_ERRORS as e:
+            logger.debug(f"[mm] Could not check close order status for {coin}: {e}")
+            return False
